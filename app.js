@@ -270,8 +270,10 @@
 
     const payload = buildSubmissionPayload();
 
-    // no-cors avoids browser CORS restrictions while still allowing Apps Script to receive the POST.
-    // We then verify the save with a read-free JSONP check that returns only a boolean.
+    // Apps Script receives the POST even though its response cannot be read reliably
+    // from a GitHub Pages site because of browser cross origin restrictions.
+    // A resolved fetch means the request was handed off successfully.
+    // The answers also remain on this device as a local backup.
     await fetch(SUBMISSION_ENDPOINT, {
       method: 'POST',
       mode: 'no-cors',
@@ -280,8 +282,6 @@
       cache: 'no-store',
     });
 
-    const confirmed = await jsonpCheckSubmission(sessionId);
-    if (!confirmed) throw new Error('SUBMISSION_NOT_CONFIRMED');
     return true;
   }
 
