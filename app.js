@@ -4,27 +4,14 @@
   const STORAGE_KEY = 'neuro-review-game-v2';
   const MAX_ATTEMPTS = 3;
 
-  // Shared storage. This reuses the Firebase project that already powers the Bulgaria site.
-  // Each browser gets one random session id, so partial progress can be updated without creating duplicates.
-  const FIREBASE_CONFIG = {
-    apiKey: 'AIzaSyDJ6LT6RCZv3gdj9J2pqv7P5kF1QLnGPKs',
-    authDomain: 'bulgariafamily-89d51.firebaseapp.com',
-    projectId: 'bulgariafamily-89d51',
-    storageBucket: 'bulgariafamily-89d51.firebasestorage.app',
-    messagingSenderId: '869953686125',
-    appId: '1:869953686125:web:9e5504a3764a49ba6ecd64',
-    measurementId: 'G-C98K35M2SF',
-  };
-  const REMOTE_COLLECTION = 'neuroReviewSubmissions';
+  // Private teacher submission endpoint.
+  // Progress stays on the student's device. Answers are sent only when the student chooses to submit.
+  const SUBMISSION_ENDPOINT = String(
+    (window.NEURO_REVIEW_CONFIG && window.NEURO_REVIEW_CONFIG.submissionEndpoint) || ''
+  ).trim();
   const SESSION_ID_KEY = 'neuro-review-session-id';
-  const REMOTE_SAVE_DELAY = 1200;
-
-  // Kept as an optional fallback adapter. It is not needed for the Firebase setup.
-  window.RESPONSE_ENDPOINT = window.RESPONSE_ENDPOINT || '';
 
   let sessionId = getOrCreateSessionId();
-  const remoteStoreReady = initRemoteStore();
-  let remoteSaveTimer = null;
 
   const stages = [
     {
@@ -185,7 +172,6 @@
 
   function saveState() {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
-    queueRemoteSave();
   }
 
   function getOrCreateSessionId() {
@@ -196,28 +182,6 @@
       : `session-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
     localStorage.setItem(SESSION_ID_KEY, id);
     return id;
-  }
-
-  async function initRemoteStore() {
-    try {
-      const [{ initializeApp }, firestore] = await Promise.all([
-        import('https://www.gstatic.com/firebasejs/12.16.0/firebase-app.js'),
-        import('https://www.gstatic.com/firebasejs/12.16.0/firebase-firestore.js'),
-      ]);
-      const app = initializeApp(FIREBASE_CONFIG, 'neuroReviewApp');
-      const db = firestore.getFirestore(app);
-      setSyncStatus('החיבור לשמירה המקוונת מוכן.');
-      return {
-        async save(id, data) {
-          const ref = firestore.doc(db, REMOTE_COLLECTION, id);
-          await firestore.setDoc(ref, data, { merge: true });
-        },
-      };
-    } catch (error) {
-      console.warn('Remote storage unavailable. Local storage remains active.', error);
-      setSyncStatus('התשובות נשמרות במכשיר. ננסה שוב כאשר יהיה חיבור.');
-      return null;
-    }
   }
 
   function hasMeaningfulProgress() {
@@ -233,15 +197,15 @@
     });
   }
 
-  function buildRemotePayload(mode = 'progress') {
+  function buildSubmissionPayload() {
     return {
       sessionId,
       participantName: (state.participantName || '').trim(),
-      mode,
-      currentStage: state.currentStage,
+      submittedAt: new Date().toISOString(),
       completedAt: state.completedAt || null,
-      updatedAt: Date.now(),
-      updatedAtIso: new Date().toISOString(),
+      currentStage: state.currentStage,
+      completedCount: completedCount(),
+      totalQuestions: getAllQuestions().length,
       responses: getAllQuestions().map(q => ({
         id: q.id,
         prompt: q.prompt,
@@ -252,32 +216,73 @@
     };
   }
 
-  function queueRemoteSave(delay = REMOTE_SAVE_DELAY) {
-    if (!hasMeaningfulProgress()) return;
-    window.clearTimeout(remoteSaveTimer);
-    remoteSaveTimer = window.setTimeout(() => {
-      saveRemoteState('progress');
-    }, delay);
-  }
-
-  async function saveRemoteState(mode = 'progress') {
-    if (!hasMeaningfulProgress()) return false;
-    const remote = await remoteStoreReady;
-    if (!remote) return false;
-    try {
-      await remote.save(sessionId, buildRemotePayload(mode));
-      setSyncStatus('התשובות נשמרו גם אונליין.');
-      return true;
-    } catch (error) {
-      console.warn('Remote save failed. Local storage remains active.', error);
-      setSyncStatus('התשובות נשמרות במכשיר. ננסה שוב כאשר יהיה חיבור.');
-      return false;
-    }
-  }
-
   function setSyncStatus(message) {
     const el = document.getElementById('sync-status');
     if (el) el.textContent = message;
+  }
+
+  function jsonpCheckSubmission(id, timeoutMs = 9000) {
+    return new Promise((resolve) => {
+      if (!SUBMISSION_ENDPOINT) {
+        resolve(false);
+        return;
+      }
+
+      const callbackName = `__neuroReviewCheck_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      const script = document.createElement('script');
+      let finished = false;
+
+      const cleanup = () => {
+        if (finished) return;
+        finished = true;
+        window.clearTimeout(timer);
+        delete window[callbackName];
+        script.remove();
+      };
+
+      window[callbackName] = (result) => {
+        const found = Boolean(result && result.ok && result.found);
+        cleanup();
+        resolve(found);
+      };
+
+      const separator = SUBMISSION_ENDPOINT.includes('?') ? '&' : '?';
+      script.src = `${SUBMISSION_ENDPOINT}${separator}action=check&submissionId=${encodeURIComponent(id)}&callback=${encodeURIComponent(callbackName)}&_=${Date.now()}`;
+      script.async = true;
+      script.onerror = () => {
+        cleanup();
+        resolve(false);
+      };
+
+      const timer = window.setTimeout(() => {
+        cleanup();
+        resolve(false);
+      }, timeoutMs);
+
+      document.head.appendChild(script);
+    });
+  }
+
+  async function sendSubmission() {
+    if (!SUBMISSION_ENDPOINT) {
+      throw new Error('SUBMISSION_ENDPOINT_NOT_CONFIGURED');
+    }
+
+    const payload = buildSubmissionPayload();
+
+    // no-cors avoids browser CORS restrictions while still allowing Apps Script to receive the POST.
+    // We then verify the save with a read-free JSONP check that returns only a boolean.
+    await fetch(SUBMISSION_ENDPOINT, {
+      method: 'POST',
+      mode: 'no-cors',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify(payload),
+      cache: 'no-store',
+    });
+
+    const confirmed = await jsonpCheckSubmission(sessionId);
+    if (!confirmed) throw new Error('SUBMISSION_NOT_CONFIRMED');
+    return true;
   }
 
   function normalize(value) {
@@ -671,7 +676,7 @@
           <div class="summary-box"><strong>${reviewed + revealed}</strong><span>תשובות הושוו לכיוון</span></div>
           <div class="summary-box"><strong>${remaining}</strong><span>נשארו להשלמה</span></div>
         </div>
-        <button type="button" class="primary-button" id="submit-results">שמירה וסיום</button>
+        <button type="button" class="primary-button" id="submit-results">שליחת התשובות למורה</button>
         <p class="feedback" id="submit-feedback" role="status"></p>
       </section>
     `;
@@ -683,39 +688,37 @@
     const button = document.getElementById('submit-results');
     const feedback = document.getElementById('submit-feedback');
 
-    button.disabled = true;
-    feedback.textContent = 'שומר...';
-    feedback.className = 'feedback';
-
-    const savedToFirebase = await saveRemoteState('submitted');
-    if (savedToFirebase) {
-      feedback.textContent = 'התשובות נשמרו בהצלחה. אפשר לסגור את העמוד.';
-      feedback.className = 'feedback success';
-      button.textContent = 'נשמר ✓';
+    if (!hasMeaningfulProgress()) {
+      feedback.textContent = 'עדיין אין תשובות לשליחה.';
+      feedback.className = 'feedback error';
       return;
     }
 
-    if (window.RESPONSE_ENDPOINT) {
-      try {
-        const response = await fetch(window.RESPONSE_ENDPOINT, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(buildRemotePayload('submitted')),
-        });
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        feedback.textContent = 'התשובות נשמרו בהצלחה. אפשר לסגור את העמוד.';
-        feedback.className = 'feedback success';
-        button.textContent = 'נשמר ✓';
-        return;
-      } catch (error) {
-        console.warn('Fallback response endpoint failed.', error);
-      }
+    if (!SUBMISSION_ENDPOINT) {
+      feedback.textContent = 'הגיליון של המורה עדיין לא חובר לאתר.';
+      feedback.className = 'feedback error';
+      return;
     }
 
-    feedback.textContent = 'לא הצלחנו לשמור אונליין כרגע. התשובות עדיין שמורות במכשיר הזה.';
-    feedback.className = 'feedback error';
-    button.disabled = false;
+    button.disabled = true;
+    feedback.textContent = 'שולח למורה...';
+    feedback.className = 'feedback';
+
+    try {
+      await sendSubmission();
+      localStorage.setItem('neuro-review-last-submitted-at', new Date().toISOString());
+      feedback.textContent = 'התשובות נשלחו למורה בהצלחה. אפשר לסגור את העמוד.';
+      feedback.className = 'feedback success';
+      button.textContent = 'נשלח ✓';
+      setSyncStatus('התשובות נשלחו למורה. ההתקדמות נשארת שמורה גם במכשיר הזה.');
+    } catch (error) {
+      console.warn('Submission failed.', error);
+      feedback.textContent = 'לא הצלחנו לאשר שהשליחה הגיעה. התשובות עדיין שמורות במכשיר הזה ואפשר לנסות שוב.';
+      feedback.className = 'feedback error';
+      button.disabled = false;
+    }
   }
+
 
 
   function escapeHtml(value) {
@@ -727,10 +730,6 @@
       .replace(/'/g, '&#039;');
   }
 
-  window.addEventListener('online', () => queueRemoteSave(150));
-  window.addEventListener('pagehide', () => {
-    if (hasMeaningfulProgress()) saveRemoteState('progress');
-  });
 
   resetButton.addEventListener('click', () => {
     const confirmed = window.confirm('לאפס את כל ההתקדמות והתשובות במכשיר הזה?');
@@ -743,5 +742,5 @@
   });
 
   render();
-  queueRemoteSave(250);
+  setSyncStatus('ההתקדמות נשמרת במכשיר. התשובות נשלחות למורה רק כשלוחצים על שליחת התשובות למורה.');
 })();
